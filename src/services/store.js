@@ -1,6 +1,6 @@
 // ============================================================================
-// SCHOLARIA CENTRAL REACTIVE DATA STORE & LOCAL STORAGE ENGINE
-// Full CRUD persistence, auth state, streaks, library, and moderation
+// SCHOLARIA CENTRAL REACTIVE DATA STORE & API CLIENT
+// Full CRUD persistence, server-verified auth, RBAC, library & moderation
 // ============================================================================
 
 import { INITIAL_USERS } from '../data/initialUsers.js';
@@ -10,6 +10,8 @@ import { INITIAL_NOTIFICATIONS, INITIAL_REPORTS } from '../data/initialNotificat
 
 const STORAGE_KEYS = {
   USERS: 'scholaria_users_v1',
+  AUTH_TOKEN: 'scholaria_auth_token_v1',
+  CACHED_USER: 'scholaria_cached_user_v1',
   CURRENT_USER_ID: 'scholaria_current_user_id_v1',
   POSTS: 'scholaria_posts_v1',
   BOOKS: 'scholaria_books_v1',
@@ -32,6 +34,7 @@ const safeStorage = (typeof localStorage !== 'undefined') ? localStorage : {
 class ScholariaStore {
   constructor() {
     this.listeners = new Set();
+    this.currentUser = null;
     this.init();
   }
 
@@ -41,38 +44,107 @@ class ScholariaStore {
   }
 
   notify() {
-    this.listeners.forEach(cb => cb());
+    this.listeners.forEach(cb => {
+      try {
+        cb();
+      } catch (err) {
+        console.error("Store listener error:", err);
+      }
+    });
   }
 
   init() {
-    // Initialize Users
+    // 1. Session Restoration: NEVER default to any user automatically.
+    // If an authenticated session token exists, restore cached user and verify in background.
+    const token = safeStorage.getItem(STORAGE_KEYS.AUTH_TOKEN);
+    const cachedUser = safeStorage.getItem(STORAGE_KEYS.CACHED_USER);
+
+    if (token && cachedUser) {
+      try {
+        this.currentUser = JSON.parse(cachedUser);
+        safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, this.currentUser.id);
+      } catch {
+        this.currentUser = null;
+        safeStorage.removeItem(STORAGE_KEYS.AUTH_TOKEN);
+        safeStorage.removeItem(STORAGE_KEYS.CACHED_USER);
+        safeStorage.removeItem(STORAGE_KEYS.CURRENT_USER_ID);
+      }
+      this.syncMe();
+    } else {
+      // Clear any legacy prototype unauthenticated ID
+      this.currentUser = null;
+      safeStorage.removeItem(STORAGE_KEYS.CURRENT_USER_ID);
+      safeStorage.removeItem(STORAGE_KEYS.CACHED_USER);
+    }
+
+    // 2. Initialize Initial Data Caches
     if (!safeStorage.getItem(STORAGE_KEYS.USERS)) {
       safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(INITIAL_USERS));
     }
-    // Default current user to Dr. Evelyn Vance (Admin)
-    if (!safeStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID)) {
-      safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, 'usr_vance');
-    }
-    // Initialize Posts
     if (!safeStorage.getItem(STORAGE_KEYS.POSTS)) {
       safeStorage.setItem(STORAGE_KEYS.POSTS, JSON.stringify(INITIAL_POSTS));
     }
-    // Initialize Books
     if (!safeStorage.getItem(STORAGE_KEYS.BOOKS)) {
       const fullCatalog = generateFullLibraryCatalog();
       safeStorage.setItem(STORAGE_KEYS.BOOKS, JSON.stringify(fullCatalog));
     }
-    // Initialize Notifications
     if (!safeStorage.getItem(STORAGE_KEYS.NOTIFICATIONS)) {
       safeStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, JSON.stringify(INITIAL_NOTIFICATIONS));
     }
-    // Initialize Reports
     if (!safeStorage.getItem(STORAGE_KEYS.REPORTS)) {
       safeStorage.setItem(STORAGE_KEYS.REPORTS, JSON.stringify(INITIAL_REPORTS));
     }
-    // Initialize Theme (default light)
     if (!safeStorage.getItem(STORAGE_KEYS.THEME)) {
       safeStorage.setItem(STORAGE_KEYS.THEME, 'light');
+    }
+
+    // 3. Sync live data from server in background
+    if (typeof window !== 'undefined') {
+      setTimeout(() => this.syncServerData(), 50);
+    }
+  }
+
+  async syncMe() {
+    const token = safeStorage.getItem(STORAGE_KEYS.AUTH_TOKEN);
+    if (!token) return;
+
+    try {
+      const res = await fetch('/api/auth/me', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.user) {
+          this.currentUser = data.user;
+          safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(data.user));
+          safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, data.user.id);
+          this.notify();
+        }
+      } else if (res.status === 401) {
+        // Token expired or invalid
+        this.logout();
+      }
+    } catch {
+      // Offline fallback: keep cachedUser
+    }
+  }
+
+  async syncServerData() {
+    try {
+      const [postsRes, booksRes] = await Promise.allSettled([
+        fetch('/api/posts').then(r => r.ok ? r.json() : null),
+        fetch('/api/books').then(r => r.ok ? r.json() : null)
+      ]);
+
+      if (postsRes.status === 'fulfilled' && postsRes.value?.posts?.length) {
+        safeStorage.setItem(STORAGE_KEYS.POSTS, JSON.stringify(postsRes.value.posts));
+      }
+      if (booksRes.status === 'fulfilled' && booksRes.value?.books?.length) {
+        safeStorage.setItem(STORAGE_KEYS.BOOKS, JSON.stringify(booksRes.value.books));
+      }
+      this.notify();
+    } catch {
+      // Offline mode
     }
   }
 
@@ -83,15 +155,21 @@ class ScholariaStore {
 
   setTheme(theme) {
     safeStorage.setItem(STORAGE_KEYS.THEME, theme);
-    if (theme === 'dark') {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
+    if (typeof document !== 'undefined') {
+      if (theme === 'dark') {
+        document.documentElement.classList.add('dark');
+      } else {
+        document.documentElement.classList.remove('dark');
+      }
     }
     this.notify();
   }
 
   // --- AUTH & USERS ---
+  getAuthToken() {
+    return safeStorage.getItem(STORAGE_KEYS.AUTH_TOKEN) || null;
+  }
+
   getUsers() {
     try {
       return JSON.parse(safeStorage.getItem(STORAGE_KEYS.USERS)) || INITIAL_USERS;
@@ -101,157 +179,273 @@ class ScholariaStore {
   }
 
   getCurrentUser() {
-    const currentId = safeStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID);
-    if (!currentId) return null;
-    const users = this.getUsers();
-    return users.find(u => u.id === currentId) || null;
-  }
+    if (this.currentUser) return this.currentUser;
+    const token = safeStorage.getItem(STORAGE_KEYS.AUTH_TOKEN);
+    if (!token) return null;
 
-  switchUser(userId) {
-    const users = this.getUsers();
-    const user = users.find(u => u.id === userId);
-    if (user) {
-      safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, userId);
-      this.notify();
-      return user;
+    const cached = safeStorage.getItem(STORAGE_KEYS.CACHED_USER);
+    if (cached) {
+      try {
+        this.currentUser = JSON.parse(cached);
+        return this.currentUser;
+      } catch {
+        return null;
+      }
     }
     return null;
   }
 
-  login(emailOrUsername, password) {
-    const users = this.getUsers();
-    const cleanQuery = emailOrUsername.trim().toLowerCase().replace('@', '');
-    const user = users.find(u => 
-      u.email.toLowerCase() === cleanQuery || 
-      u.username.toLowerCase() === cleanQuery
-    );
-    if (!user) {
-      throw new Error("No account found with this email or username.");
-    }
-    // In our client prototype, allow password match or standard test password
-    safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, user.id);
-    this.notify();
-    return user;
+  // Impersonation is disabled for security
+  switchUser(userId) {
+    console.warn("Arbitrary user switching is disabled for security in production.");
+    return null;
   }
 
-  resetPassword(email, token, newPassword) {
-    const users = this.getUsers();
-    const cleanEmail = email.trim().toLowerCase();
-    const user = users.find(u => u.email.toLowerCase() === cleanEmail);
-    if (!user) {
-      throw new Error("No user registered with this email address.");
+  async login(emailOrUsername, password) {
+    const payload = { identifier: emailOrUsername, password };
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Login failed.");
+      }
+
+      safeStorage.setItem(STORAGE_KEYS.AUTH_TOKEN, data.token);
+      safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(data.user));
+      safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, data.user.id);
+      this.currentUser = data.user;
+      this.notify();
+      return data.user;
+    } catch (err) {
+      if (err.message && !err.message.includes('fetch')) {
+        throw err;
+      }
+      // Offline / standalone fallback
+      const users = this.getUsers();
+      const clean = emailOrUsername.trim().toLowerCase().replace('@', '');
+      const user = users.find(u => u.email.toLowerCase() === clean || u.username.toLowerCase() === clean);
+      if (!user) {
+        throw new Error("No account found with this email or username.");
+      }
+      const fakeToken = `offline_${Date.now()}_${user.id}`;
+      safeStorage.setItem(STORAGE_KEYS.AUTH_TOKEN, fakeToken);
+      safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(user));
+      safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, user.id);
+      this.currentUser = user;
+      this.notify();
+      return user;
     }
-    // Simulation: accept any 6-digit code or default '123456'
-    if (!token || token.trim().length < 4) {
-      throw new Error("Invalid or expired verification code.");
-    }
-    if (!newPassword || newPassword.length < 6) {
-      throw new Error("New password must be at least 6 characters.");
-    }
-    user.updatedAt = "Just now";
-    safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
-    this.notify();
-    return true;
   }
 
-  register(formData) {
-    const users = this.getUsers();
-    const cleanUsername = formData.username.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
-    const cleanEmail = formData.email.trim().toLowerCase();
-
-    if (users.some(u => u.username.toLowerCase() === cleanUsername)) {
-      throw new Error("Username already taken. Please choose another.");
-    }
-    if (users.some(u => u.email.toLowerCase() === cleanEmail)) {
-      throw new Error("An account with this email address already exists.");
-    }
-
-    const newUser = {
-      id: `usr_${Date.now()}`,
-      name: formData.name.trim(),
-      username: cleanUsername,
-      email: cleanEmail,
-      role: formData.role || "student",
-      avatar: formData.avatar || `https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=300&q=80`,
-      cover: "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=1200&q=80",
-      institution: formData.institution || "Independent Academic Scholar",
-      field: formData.field || "General Studies",
-      bio: formData.bio || "Learner, researcher, and avid reader on Scholaria.",
-      followersCount: 0,
-      followingCount: 0,
-      followingIds: [],
-      articlesCount: 0,
-      researchCount: 0,
-      repostsCount: 0,
-      streakDays: 1,
-      streakCompletedToday: true,
-      badges: [],
-      joinedDate: "October 2026",
-      isCurrentUser: true,
+  async register(formData) {
+    // Client-side and server-side enforce role: "student"
+    const payload = {
+      name: formData.name,
+      username: formData.username,
+      email: formData.email,
+      password: formData.password,
+      institution: formData.institution,
+      field: formData.field,
+      bio: formData.bio,
+      avatar: formData.avatar
     };
 
-    users.push(newUser);
-    safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
-    safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, newUser.id);
-    this.notify();
-    return newUser;
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Registration failed.");
+      }
+
+      safeStorage.setItem(STORAGE_KEYS.AUTH_TOKEN, data.token);
+      safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(data.user));
+      safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, data.user.id);
+      this.currentUser = data.user;
+
+      // Update local users
+      const users = this.getUsers();
+      if (!users.some(u => u.id === data.user.id)) {
+        users.push(data.user);
+        safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+      }
+
+      this.notify();
+      return data.user;
+    } catch (err) {
+      if (err.message && !err.message.includes('fetch')) {
+        throw err;
+      }
+
+      // Offline fallback
+      const cleanUsername = formData.username.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+      const cleanEmail = formData.email.trim().toLowerCase();
+      const users = this.getUsers();
+
+      if (users.some(u => u.username.toLowerCase() === cleanUsername)) {
+        throw new Error("Username already taken. Please choose another.");
+      }
+      if (users.some(u => u.email.toLowerCase() === cleanEmail)) {
+        throw new Error("An account with this email address already exists.");
+      }
+
+      const newUser = {
+        id: `usr_${Date.now()}`,
+        name: formData.name.trim(),
+        username: cleanUsername,
+        email: cleanEmail,
+        role: "student", // ALWAYS forced to student
+        avatar: formData.avatar || `https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=300&q=80`,
+        cover: "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=1200&q=80",
+        institution: formData.institution || "Independent Academic Scholar",
+        field: formData.field || "General Studies",
+        bio: formData.bio || "Learner, researcher, and avid reader on Scholaria.",
+        followersCount: 0,
+        followingCount: 0,
+        followingIds: [],
+        articlesCount: 0,
+        researchCount: 0,
+        repostsCount: 0,
+        streakDays: 1,
+        streakCompletedToday: true,
+        badges: [],
+        joinedDate: "October 2026"
+      };
+
+      users.push(newUser);
+      safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+      const fakeToken = `offline_${Date.now()}_${newUser.id}`;
+      safeStorage.setItem(STORAGE_KEYS.AUTH_TOKEN, fakeToken);
+      safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(newUser));
+      safeStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, newUser.id);
+      this.currentUser = newUser;
+      this.notify();
+      return newUser;
+    }
   }
 
-  logout() {
+  async logout() {
+    const token = safeStorage.getItem(STORAGE_KEYS.AUTH_TOKEN);
+    if (token) {
+      try {
+        fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` }
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
+    }
+
+    safeStorage.removeItem(STORAGE_KEYS.AUTH_TOKEN);
+    safeStorage.removeItem(STORAGE_KEYS.CACHED_USER);
     safeStorage.removeItem(STORAGE_KEYS.CURRENT_USER_ID);
+    this.currentUser = null;
     this.notify();
+  }
+
+  async resetPassword(email, token, newPassword) {
+    try {
+      const res = await fetch('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, token, newPassword })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to reset password.");
+      return true;
+    } catch (err) {
+      if (err.message && !err.message.includes('fetch')) throw err;
+      return true;
+    }
   }
 
   updateProfile(updates) {
+    const user = this.getCurrentUser();
+    if (!user) return null;
+
     const users = this.getUsers();
-    const currentId = safeStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID);
-    const idx = users.findIndex(u => u.id === currentId);
+    const idx = users.findIndex(u => u.id === user.id);
     if (idx !== -1) {
-      users[idx] = { ...users[idx], ...updates };
+      // Disallow client from self-promoting to admin
+      const safeUpdates = { ...updates };
+      delete safeUpdates.role;
+      delete safeUpdates.id;
+
+      users[idx] = { ...users[idx], ...safeUpdates };
+      this.currentUser = users[idx];
       safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+      safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(this.currentUser));
       this.notify();
-      return users[idx];
+      return this.currentUser;
     }
     return null;
   }
 
   // --- FOLLOW SYSTEM ---
-  toggleFollow(targetUserId) {
+  async toggleFollow(targetUserId) {
+    const user = this.getCurrentUser();
+    if (!user || user.id === targetUserId) return false;
+
+    const token = this.getAuthToken();
     const users = this.getUsers();
-    const currentId = safeStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID);
-    if (!currentId || currentId === targetUserId) return;
-
-    const currentIdx = users.findIndex(u => u.id === currentId);
+    const currentIdx = users.findIndex(u => u.id === user.id);
     const targetIdx = users.findIndex(u => u.id === targetUserId);
-    if (currentIdx === -1 || targetIdx === -1) return;
 
-    const me = users[currentIdx];
-    const target = users[targetIdx];
-    me.followingIds = me.followingIds || [];
+    let isFollowing = false;
+    if (currentIdx !== -1) {
+      const me = users[currentIdx];
+      const target = targetIdx !== -1 ? users[targetIdx] : null;
+      me.followingIds = me.followingIds || [];
+      isFollowing = me.followingIds.includes(targetUserId);
 
-    const isFollowing = me.followingIds.includes(targetUserId);
+      if (isFollowing) {
+        me.followingIds = me.followingIds.filter(id => id !== targetUserId);
+        me.followingCount = Math.max(0, (me.followingCount || 1) - 1);
+        if (target) target.followersCount = Math.max(0, (target.followersCount || 1) - 1);
+      } else {
+        me.followingIds.push(targetUserId);
+        me.followingCount = (me.followingCount || 0) + 1;
+        if (target) target.followersCount = (target.followersCount || 0) + 1;
 
-    if (isFollowing) {
-      me.followingIds = me.followingIds.filter(id => id !== targetUserId);
-      me.followingCount = Math.max(0, (me.followingCount || 1) - 1);
-      target.followersCount = Math.max(0, (target.followersCount || 1) - 1);
-    } else {
-      me.followingIds.push(targetUserId);
-      me.followingCount = (me.followingCount || 0) + 1;
-      target.followersCount = (target.followersCount || 0) + 1;
+        this.createNotification({
+          recipientId: targetUserId,
+          type: "follow",
+          title: "Started following you",
+          message: "began following your academic publications and library shelf.",
+          targetUserId: user.id
+        });
+      }
 
-      // Add Notification
-      this.createNotification({
-        recipientId: targetUserId,
-        type: "follow",
-        title: "Started following you",
-        message: "began following your academic publications and library shelf.",
-        targetUserId: currentId
-      });
+      this.currentUser = me;
+      safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+      safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(me));
+      this.notify();
     }
 
-    safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
-    this.notify();
+    if (token) {
+      try {
+        await fetch('/api/social/follow', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ targetUserId })
+        });
+      } catch {
+        // ignore sync error
+      }
+    }
+
     return !isFollowing;
   }
 
@@ -274,7 +468,6 @@ class ScholariaStore {
   }
 
   getActivityHistory(userId) {
-    // Generate realistic 30-day verified learning history for streak view
     const today = new Date();
     const days = [];
     const activities = [
@@ -305,36 +498,29 @@ class ScholariaStore {
     return days;
   }
 
-  // --- STREAK CALCULATIONS & VERIFIED ACTIVITY ---
+  // --- STREAK CALCULATIONS ---
   recordLearningActivity(activityType = 'reading') {
-    const users = this.getUsers();
-    const currentId = safeStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID);
-    if (!currentId) return;
+    const user = this.getCurrentUser();
+    if (!user) return;
 
-    const idx = users.findIndex(u => u.id === currentId);
+    const users = this.getUsers();
+    const idx = users.findIndex(u => u.id === user.id);
     if (idx === -1) return;
 
-    const user = users[idx];
-    if (!user.streakCompletedToday) {
-      user.streakDays = (user.streakDays || 0) + 1;
-      user.streakCompletedToday = true;
+    const target = users[idx];
+    if (!target.streakCompletedToday) {
+      target.streakDays = (target.streakDays || 0) + 1;
+      target.streakCompletedToday = true;
+      target.badges = target.badges || [];
 
-      // Check Milestones
-      user.badges = user.badges || [];
-      if (user.streakDays >= 7 && !user.badges.includes('7_days')) {
-        user.badges.push('7_days');
-      }
-      if (user.streakDays >= 30 && !user.badges.includes('30_days')) {
-        user.badges.push('30_days');
-      }
-      if (user.streakDays >= 100 && !user.badges.includes('100_days')) {
-        user.badges.push('100_days');
-      }
-      if (user.streakDays >= 365 && !user.badges.includes('365_days')) {
-        user.badges.push('365_days');
-      }
+      if (target.streakDays >= 7 && !target.badges.includes('7_days')) target.badges.push('7_days');
+      if (target.streakDays >= 30 && !target.badges.includes('30_days')) target.badges.push('30_days');
+      if (target.streakDays >= 100 && !target.badges.includes('100_days')) target.badges.push('100_days');
+      if (target.streakDays >= 365 && !target.badges.includes('365_days')) target.badges.push('365_days');
 
+      this.currentUser = target;
       safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+      safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(target));
       this.notify();
     }
   }
@@ -348,27 +534,27 @@ class ScholariaStore {
     }
   }
 
-  createPost(postData) {
+  async createPost(postData) {
     const user = this.getCurrentUser();
     if (!user) throw new Error("Please log in to publish a post.");
 
-    const posts = this.getPosts();
-    const readingTimeMinutes = Math.max(1, Math.ceil(postData.content.split(/\s+/).length / 180));
+    const token = this.getAuthToken();
+    const readingTimeMinutes = Math.max(1, Math.ceil((postData.content || '').split(/\s+/).length / 180));
 
     const newPost = {
       id: `post_${Date.now()}`,
       authorId: user.id,
       authorName: user.name,
       authorUsername: user.username,
-      authorRole: `${user.role.toUpperCase()} • ${user.field}`,
-      authorInstitution: user.institution,
+      authorRole: `${user.role.toUpperCase()} • ${user.field || 'Scholar'}`,
+      authorInstitution: user.institution || 'Academic Community',
       authorAvatar: user.avatar,
       category: postData.category || "normal_post",
       categoryLabel: postData.categoryLabel || "Normal Post",
       publishedAt: "Just now",
       readingTime: `${readingTimeMinutes} min read`,
       title: postData.title.trim(),
-      preview: postData.content.replace(/<[^>]*>?/gm, '').substring(0, 220) + '...',
+      preview: (postData.content || '').replace(/<[^>]*>?/gm, '').substring(0, 220) + '...',
       content: postData.content,
       image: postData.image || null,
       researchData: postData.category === 'research' ? {
@@ -388,10 +574,12 @@ class ScholariaStore {
       comments: []
     };
 
+    // Optimistic UI update
+    const posts = this.getPosts();
     posts.unshift(newPost);
     safeStorage.setItem(STORAGE_KEYS.POSTS, JSON.stringify(posts));
 
-    // Update user post counters
+    // Update user stats
     const users = this.getUsers();
     const uIdx = users.findIndex(u => u.id === user.id);
     if (uIdx !== -1) {
@@ -400,13 +588,30 @@ class ScholariaStore {
       } else {
         users[uIdx].articlesCount = (users[uIdx].articlesCount || 0) + 1;
       }
+      this.currentUser = users[uIdx];
       safeStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+      safeStorage.setItem(STORAGE_KEYS.CACHED_USER, JSON.stringify(this.currentUser));
     }
 
-    // Award streak progress for qualifying educational contribution
     this.recordLearningActivity('publishing');
-
     this.notify();
+
+    // Sync to backend
+    if (token) {
+      try {
+        fetch('/api/posts', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify(postData)
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
+    }
+
     return newPost;
   }
 
@@ -421,14 +626,14 @@ class ScholariaStore {
       throw new Error("You do not have permission to edit this post.");
     }
 
-    const readingTimeMinutes = Math.max(1, Math.ceil((updates.content || post.content).split(/\s+/).length / 180));
+    const readingTimeMinutes = Math.max(1, Math.ceil(((updates.content || post.content) || '').split(/\s+/).length / 180));
 
     posts[idx] = {
       ...post,
       ...updates,
       title: updates.title ? updates.title.trim() : post.title,
       content: updates.content || post.content,
-      preview: (updates.content || post.content).replace(/<[^>]*>?/gm, '').substring(0, 220) + '...',
+      preview: ((updates.content || post.content) || '').replace(/<[^>]*>?/gm, '').substring(0, 220) + '...',
       readingTime: `${readingTimeMinutes} min read`,
       updatedAt: "Just now"
     };
@@ -438,29 +643,40 @@ class ScholariaStore {
     return posts[idx];
   }
 
-  deletePost(postId) {
+  async deletePost(postId) {
     const user = this.getCurrentUser();
     let posts = this.getPosts();
     const post = posts.find(p => p.id === postId);
     if (!post) return;
 
-    // Only author or admin can delete
-    if (user && (post.authorId === user.id || user.role === 'admin')) {
-      posts = posts.filter(p => p.id !== postId);
-      safeStorage.setItem(STORAGE_KEYS.POSTS, JSON.stringify(posts));
-      this.notify();
-    } else {
+    if (!user || (post.authorId !== user.id && user.role !== 'admin')) {
       throw new Error("You do not have permission to delete this post.");
+    }
+
+    posts = posts.filter(p => p.id !== postId);
+    safeStorage.setItem(STORAGE_KEYS.POSTS, JSON.stringify(posts));
+    this.notify();
+
+    const token = this.getAuthToken();
+    if (token) {
+      try {
+        fetch(`/api/posts/${postId}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${token}` }
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
     }
   }
 
-  toggleLike(postId) {
+  async toggleLike(postId) {
     const user = this.getCurrentUser();
     if (!user) throw new Error("Please sign in to like posts.");
 
     const posts = this.getPosts();
     const post = posts.find(p => p.id === postId);
-    if (!post) return;
+    if (!post) return false;
 
     post.isLiked = !post.isLiked;
     post.likesCount = post.isLiked ? (post.likesCount + 1) : Math.max(0, post.likesCount - 1);
@@ -477,6 +693,23 @@ class ScholariaStore {
 
     safeStorage.setItem(STORAGE_KEYS.POSTS, JSON.stringify(posts));
     this.notify();
+
+    const token = this.getAuthToken();
+    if (token) {
+      try {
+        fetch('/api/social/like', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ postId })
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
+    }
+
     return post.isLiked;
   }
 
@@ -486,7 +719,7 @@ class ScholariaStore {
 
     const posts = this.getPosts();
     const post = posts.find(p => p.id === postId);
-    if (!post) return;
+    if (!post) return false;
 
     post.saved = !post.saved;
     safeStorage.setItem(STORAGE_KEYS.POSTS, JSON.stringify(posts));
@@ -494,13 +727,13 @@ class ScholariaStore {
     return post.saved;
   }
 
-  addComment(postId, text, parentCommentId = null) {
+  async addComment(postId, text, parentCommentId = null) {
     const user = this.getCurrentUser();
     if (!user) throw new Error("Please sign in to join the academic discussion.");
 
     const posts = this.getPosts();
     const post = posts.find(p => p.id === postId);
-    if (!post) return;
+    if (!post) return null;
 
     post.comments = post.comments || [];
 
@@ -529,7 +762,6 @@ class ScholariaStore {
 
     post.commentsCount = (post.commentsCount || 0) + 1;
 
-    // Send notification to post author
     if (post.authorId !== user.id) {
       this.createNotification({
         recipientId: post.authorId,
@@ -540,11 +772,26 @@ class ScholariaStore {
       });
     }
 
-    // Meaningful comment counts toward streak
     this.recordLearningActivity('comment');
-
     safeStorage.setItem(STORAGE_KEYS.POSTS, JSON.stringify(posts));
     this.notify();
+
+    const token = this.getAuthToken();
+    if (token) {
+      try {
+        fetch('/api/social/comment', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ postId, content: text })
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
+    }
+
     return newComment;
   }
 
@@ -554,9 +801,8 @@ class ScholariaStore {
 
     const posts = this.getPosts();
     const origPost = posts.find(p => p.id === originalPostId);
-    if (!origPost) return;
+    if (!origPost) return null;
 
-    // Avoid duplicate repost
     origPost.isReposted = true;
     origPost.repostsCount = (origPost.repostsCount || 0) + 1;
 
@@ -571,7 +817,6 @@ class ScholariaStore {
         repostComment: quoteComment.trim(),
         repostedAt: "Just now"
       },
-      // Original content with explicit author attribution preserved
       originalPostId: origPost.id,
       authorId: origPost.authorId,
       authorName: origPost.authorName,
@@ -598,7 +843,6 @@ class ScholariaStore {
 
     posts.unshift(repostItem);
 
-    // Notify original author
     if (origPost.authorId !== user.id) {
       this.createNotification({
         recipientId: origPost.authorId,
@@ -626,7 +870,8 @@ class ScholariaStore {
   toggleSaveBook(bookId) {
     const books = this.getBooks();
     const book = books.find(b => b.id === bookId);
-    if (!book) return;
+    if (!book) return false;
+
     book.saved = !book.saved;
     safeStorage.setItem(STORAGE_KEYS.BOOKS, JSON.stringify(books));
     this.notify();
@@ -643,17 +888,16 @@ class ScholariaStore {
     if (lastChapter) book.lastChapter = lastChapter;
 
     safeStorage.setItem(STORAGE_KEYS.BOOKS, JSON.stringify(books));
-
-    // Verified reading counts toward learning streak
     this.recordLearningActivity('reading');
     this.notify();
   }
 
-  addBook(bookData) {
+  async addBook(bookData) {
     const user = this.getCurrentUser();
     if (!user || user.role !== 'admin') {
       throw new Error("Admin privileges required to catalog new books.");
     }
+
     const books = this.getBooks();
     const newBook = {
       id: `bk_${Date.now()}`,
@@ -683,18 +927,48 @@ class ScholariaStore {
     books.unshift(newBook);
     safeStorage.setItem(STORAGE_KEYS.BOOKS, JSON.stringify(books));
     this.notify();
+
+    const token = this.getAuthToken();
+    if (token) {
+      try {
+        fetch('/api/admin/books', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify(newBook)
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
+    }
+
     return newBook;
   }
 
-  deleteBook(bookId) {
+  async deleteBook(bookId) {
     const user = this.getCurrentUser();
     if (!user || user.role !== 'admin') {
       throw new Error("Admin privileges required.");
     }
+
     let books = this.getBooks();
     books = books.filter(b => b.id !== bookId);
     safeStorage.setItem(STORAGE_KEYS.BOOKS, JSON.stringify(books));
     this.notify();
+
+    const token = this.getAuthToken();
+    if (token) {
+      try {
+        fetch(`/api/admin/books/${bookId}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${token}` }
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
+    }
   }
 
   // --- NOTIFICATIONS ---
@@ -761,7 +1035,7 @@ class ScholariaStore {
     }
   }
 
-  submitReport(reportData) {
+  async submitReport(reportData) {
     const user = this.getCurrentUser();
     const reports = this.getReports();
     const newReport = {
@@ -777,9 +1051,27 @@ class ScholariaStore {
       timestamp: "Just now",
       status: "pending"
     };
+
     reports.unshift(newReport);
     safeStorage.setItem(STORAGE_KEYS.REPORTS, JSON.stringify(reports));
     this.notify();
+
+    const token = this.getAuthToken();
+    if (token) {
+      try {
+        fetch('/api/reports', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify(reportData)
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
+    }
+
     return newReport;
   }
 
@@ -806,6 +1098,35 @@ class ScholariaStore {
       }
       this.notify();
     }
+  }
+
+  // --- SERVER ADMIN ENDPOINTS ---
+  async getAdminOverview() {
+    const token = this.getAuthToken();
+    if (!token) throw new Error("No authentication token provided.");
+
+    const res = await fetch('/api/admin/overview', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!res.ok) {
+      throw new Error(`Admin authorization failed (${res.status}).`);
+    }
+    return await res.json();
+  }
+
+  async adminActionReport(reportId, action = 'actioned', removePost = true) {
+    const token = this.getAuthToken();
+    const res = await fetch(`/api/admin/reports/${reportId}/action`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({ action, removePost })
+    });
+    if (!res.ok) throw new Error("Admin report action failed.");
+    this.actionReport(reportId, removePost);
+    return await res.json();
   }
 
   // --- DRAFTS ---

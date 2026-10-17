@@ -5,7 +5,8 @@
   "description": "Educational Library & Academic Social Platform",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node tests/auth-security.test.cjs"
   },
   "keywords": [
     "education",
