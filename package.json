@@ -1,0 +1,19 @@
+{
+  "name": "scholaria",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Educational Library & Academic Social Platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "education",
+    "library",
+    "research",
+    "academic",
+    "social"
+  ],
+  "author": "Scholaria Academic Consortium",
+  "license": "MIT"
+}
